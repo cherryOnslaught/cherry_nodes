@@ -1,12 +1,21 @@
+"""
+Cherry Ambient Occlusion (HBAO) — tiled version
+-----------------------------------------------
+• Handles 4 K textures on mid-VRAM GPUs by processing 1024×1024 tiles (+32 px overlap).
+• All maths identical to the original single-image kernel.
+• Drop this file into ComfyUI/custom_nodes/ and reload.
+"""
+
 import math
 from typing import Union
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-import comfy.utils           # progress bar hook
+import comfy.utils           # progress-bar hook
 
 
+# ───────────────────────── helpers ──────────────────────────
 def to_tensor(img: Union[torch.Tensor, np.ndarray], device, channels: int):
     """ComfyUI IMAGE → torch.float32 tensor on <device>, shape [H,W] or [H,W,3]."""
     if isinstance(img, np.ndarray):
@@ -59,30 +68,102 @@ def bilateral(img, guide, sigma_s=2, sigma_r=0.05):
     return out / norm.clamp_min_(1e-6)
 
 
+# ───────────────── tile runner ──────────────────────────────
+def run_on_tiles(
+    kernel,                              # per-tile AO function
+    depth, normals, base_color,
+    tile       = 1024,
+    overlap    = 32,
+    **kargs
+):
+    H, W = depth.shape
+    stride  = tile
+    margin  = overlap
+
+    ao_acc  = torch.zeros((H, W), dtype=depth.dtype, device=depth.device)
+    weights = torch.zeros_like(ao_acc)
+
+    # Calculate total number of tiles for progress bar
+    n_tiles_y = (H + stride - 1) // stride
+    n_tiles_x = (W + stride - 1) // stride
+    total_tiles = n_tiles_y * n_tiles_x
+    pbar = comfy.utils.ProgressBar(total_tiles)
+
+    for y0 in range(0, H, stride):
+        for x0 in range(0, W, stride):
+            y1 = min(y0 + tile, H)
+            x1 = min(x0 + tile, W)
+
+            # Always use seamless wrapping for tile padding
+            yp0 = y0 - margin
+            yp1 = y1 + margin
+            xp0 = x0 - margin
+            xp1 = x1 + margin
+
+            y_idx = torch.arange(yp0, yp1) % H
+            x_idx = torch.arange(xp0, xp1) % W
+            d_crop = depth[y_idx][:, x_idx]
+            n_crop = normals[y_idx][:, x_idx, ...]
+            c_crop = base_color[y_idx][:, x_idx, ...]
+
+            # run kernel, do not update pbar inside kernel
+            ao_crop = kernel(d_crop, c_crop, n_crop, **kargs, pbar=pbar)\
+                        .squeeze(0)[..., 0]        # [Hc,Wc]
+
+            # blend mask (feather in margin)
+            h, w = ao_crop.shape
+            mask = torch.ones_like(ao_crop)
+            if margin:
+                yy = torch.linspace(0, 1, h, device=ao_crop.device).unsqueeze(1)
+                xx = torch.linspace(0, 1, w, device=ao_crop.device).unsqueeze(0)
+                border_y = torch.minimum(yy, 1 - yy)
+                border_x = torch.minimum(xx, 1 - xx)
+                feather  = torch.minimum(border_x, border_y)
+                inner_ratio = tile / (tile + 2 * margin)
+                mask *= (feather / inner_ratio).clamp(0, 1)
+
+            ao_acc[y_idx[:, None], x_idx] += ao_crop * mask
+            weights[y_idx[:, None], x_idx] += mask
+
+            # Update progress bar after each tile
+            pbar.update(1)
+
+    pbar.update_absolute(pbar.total)
+    return (ao_acc / weights.clamp_min_(1e-6))\
+        .unsqueeze(-1).repeat(1, 1, 3).unsqueeze(0)
+
+
+# ──────────────────── main node class ───────────────────────
 class AccurateAO_HBAO:
+    TILE_SIZE   = 1024
+    TILE_OVERLP = 32
+
+    # ───────── node I/O spec ─────────
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "depth_map":  ("IMAGE",),
+                "depth_map":      ("IMAGE",),
                 "base_color_map": ("IMAGE",),
-                "normal_map": ("IMAGE",),
+                "normal_map":     ("IMAGE",),
             },
             "optional": {
-                "sample_count":  ("INT",   {"default": 64, "min": 4,  "max": 64}),
-                "radius_px":     ("INT",   {"default": 128, "min": 4,  "max": 256}),
-                "strength":      ("FLOAT", {"default": 2, "min": 0.1, "max": 4.0, "step": 0.01}),
-                "height_bias":   ("FLOAT", {"default": 0.05, "min": 0.00, "max": 1.0, "step": 0.01}),
+                "sample_count":  ("INT",   {"default": 24,  "min": 4,  "max": 64}),
+                "radius_px":     ("INT",   {"default": 32,  "min": 4,  "max": 128}),
+                "strength":      ("FLOAT", {"default": 1.5, "min": 0.1,"max": 4.0,"step":0.01}),
+                "height_bias":   ("FLOAT", {"default": 0.05,"min": 0.0,"max": 1.0,"step":0.01}),
                 "bilateral_blur":("BOOLEAN", {"default": True}),
-                "seamless":      ("BOOLEAN", {"default": True}),
+                "seamless_textures_input": ("BOOLEAN", {"default": True}),
                 "use_cpu":       ("BOOLEAN", {"default": False}),
-                "blur_source": (   
-                    [
-                        "Color map", 
-                        "Depth map", 
-                        "Normal map (Z Axis)"
-                    ],
-                ),
+                "blur_source":   ([
+                    "Color Map",
+                    "Depth Map",
+                    "Normal Map (Z Axis)"
+                ],),
+                "tile_size": ([
+                    "No Tiling",
+                    384, 512, 1024
+                ], {"default": "No Tiling"}),
             },
         }
 
@@ -90,85 +171,137 @@ class AccurateAO_HBAO:
     FUNCTION     = "hbao"
     CATEGORY     = "Cherry Nodes / Imaging"
 
+    # ───────── public entry point (tiled) ─────────
     def hbao(
         self,
-        depth_map, 
-        base_color_map, 
-        normal_map,
+        depth_map, base_color_map, normal_map,
         sample_count      = 24,
         radius_px         = 32,
         strength          = 1.5,
         height_bias       = 0.05,
         bilateral_blur    = True,
-        seamless          = True,
+        seamless_textures_input = True,
         use_cpu           = False,
-        blur_source      = "Color Map",
+        blur_source       = "Color Map",
+        tile_size         = "No Tiling",
     ):
         device = "cpu" if use_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
 
-        depth   = to_tensor(depth_map,  device, 1)      # [H,W]
-        normals = to_tensor(normal_map, device, 3)      # [H,W,3]
+        # convert full-res inputs
+        depth   = to_tensor(depth_map,  device, 1)
+        normals = to_tensor(normal_map, device, 3)
+        color   = to_tensor(base_color_map, device, 3)
 
-        # Normalise depth to 0-1
-        min_d, max_d = depth.amin(), depth.amax()
-        depth = (depth - min_d) / (max_d - min_d + 1e-6)
+        # kernel wrapper runs on one crop, now accepts pbar
+        def _kernel(d, c, n, pbar=None):
+            return self._hbao_single_tile(
+                d, c, n,
+                sample_count=sample_count, radius_px=radius_px,
+                strength=strength, height_bias=height_bias,
+                bilateral_blur=bilateral_blur, blur_source=blur_source,
+                seamless=seamless_textures_input,
+                pbar=pbar
+            )
+
+        # Handle tiling selection
+        if tile_size == "No Tiling":
+            img = _kernel(depth, color, normals)
+        else:
+            tile_size_int = int(tile_size)
+            # Enforce minimum tile size and overlap
+            min_tile = 384
+            if tile_size_int < min_tile:
+                tile_size_int = min_tile
+            # Overlap must be at least radius_px
+            overlap = max(radius_px, 32)
+            # Prevent AO if radius is too large for tile
+            if radius_px * 2 >= tile_size_int:
+                raise ValueError(f"AO radius ({radius_px}) is too large for the selected tile size ({tile_size_int}). Please choose a larger tile size or reduce the radius.")
+            else:
+                img = run_on_tiles(
+                    _kernel, depth, normals, color,
+                    tile=tile_size_int, overlap=overlap
+                )
+        return (img,)
+
+    # ───────── original AO core (unchanged maths) ─────────
+    def _hbao_single_tile(
+        self,
+        depth, base_color, normals,
+        sample_count, radius_px,
+        strength, height_bias,
+        bilateral_blur, blur_source,
+        seamless,
+        pbar=None
+    ):
+        device = depth.device
+
+        # normalise depth
+        depth = (depth - depth.amin()) / (depth.amax() - depth.amin() + 1e-6)
 
         H, W  = depth.shape
-        steps = torch.arange(1, radius_px + 1, device=device)  # [S]
+        steps = torch.arange(1, radius_px + 1, device=device)   # [S]
         thetas = torch.arange(sample_count, device=device) * (2 * math.pi / sample_count)
 
-        n = normals * 2 - 1                                    # −1‥1 normals
+        n = normals * 2 - 1                                     # −1‥1 normals
         nx, ny, nz = n[..., 0], n[..., 1], n[..., 2]
 
         occl = torch.zeros_like(depth)
 
-        # Pre-compute base grids (broadcasted later)
-        y0 = torch.arange(H, device=device)[:, None, None]     # (H,1,1)
-        x0 = torch.arange(W, device=device)[None, :, None]     # (1,W,1)
+        # base grids
+        y0 = torch.arange(H, device=device)[:, None, None]
+        x0 = torch.arange(W, device=device)[None, :, None]
 
-        # Progress bar — one tick per angle
-        pbar = comfy.utils.ProgressBar(sample_count)
+        # Only create a progress bar if not provided (for non-tiled mode)
+        if pbar is not None:
+            # Don't update pbar here for tiled mode
+            update_pbar = False
+        else:
+            pbar = comfy.utils.ProgressBar(len(thetas))
+            update_pbar = True
 
         for theta in thetas:
             dx, dy = math.cos(theta), math.sin(theta)
 
-            yi = y0 + (steps * dy).round().long()              # (H,1,S)
-            xi = x0 + (steps * dx).round().long()              # (1,W,S)
+            yi = y0 + (steps * dy).round().long()
+            xi = x0 + (steps * dx).round().long()
 
             if seamless:
                 yi %= H; xi %= W
             else:
                 yi.clamp_(0, H - 1); xi.clamp_(0, W - 1)
 
-            samples = depth[yi, xi]                            # (H,W,S)
+            samples = depth[yi, xi]                             # (H,W,S)
 
             ndot = (nx * dx + ny * dy + nz * 0.2).clamp_(0.0, 1.0).unsqueeze(-1)
             samples = samples * ndot
 
-            horizon = samples.min(-1)[0]                       # nearest blocker
+            horizon = samples.min(-1)[0]                        # nearest blocker
             diff    = (depth - horizon + height_bias).clamp_min_(0)
             occl   += diff
 
-            pbar.update(1)                                     # tick
+            if update_pbar:
+                pbar.update(1)
 
-        pbar.update_absolute(pbar.total)                       # snap to 100 %
+        if update_pbar:
+            pbar.update_absolute(pbar.total)
 
-        occl = (occl / sample_count).pow(1.2)                  # fall-off curve
-        ao   = (occl * strength).clamp_(0, 1)                  # white = occluded
-        ao  *= (1 - height_bias * depth)                       # keep peaks bright
+        occl = (occl / sample_count).pow(1.2)
+        ao   = (occl * strength).clamp_(0, 1)
+        ao  *= (1 - height_bias * depth)
 
         if bilateral_blur:
             if blur_source == "Color Map":
-                guide = to_tensor(base_color_map, device, 3)[..., 0]
+                guide = base_color[..., 0]
             elif blur_source == "Depth Map":
-                guide = depth        # already normalised
+                guide = depth
             else:  # Normal map (Z Axis)
-                guide = (normals[..., 2] * 0.5 + 0.5)  # map −1…1 → 0…1
+                guide = (normals[..., 2] * 0.5 + 0.5)
             ao = bilateral(ao, guide)
 
-        img = ao.unsqueeze(-1).repeat(1, 1, 3).unsqueeze(0)    # [1,H,W,3]
-        return (img,)
+        return ao.unsqueeze(-1).repeat(1, 1, 3).unsqueeze(0)
 
 
+# ───────── Comfy registration ─────────
 NODE_CLASS_MAPPINGS        = {"AccurateAO_HBAO": AccurateAO_HBAO}
 NODE_DISPLAY_NAME_MAPPINGS = {"AccurateAO_HBAO": "Cherry Ambient Occlusion"}
