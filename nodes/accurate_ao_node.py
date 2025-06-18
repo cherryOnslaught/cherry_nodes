@@ -1,9 +1,9 @@
 """
-Cherry Ambient Occlusion (HBAO) — tiled version
------------------------------------------------
-• Handles 4 K textures on mid-VRAM GPUs by processing 1024×1024 tiles (+32 px overlap).
-• All maths identical to the original single-image kernel.
-• Drop this file into ComfyUI/custom_nodes/ and reload.
+Cherry Ambient Occlusion
+• Accurate Horizon-Based Ambient Occlusion (HBAO)
+• Uses bilateral filtering for noise reduction
+• Supports seamless textures
+• Tiling support for large images
 """
 
 import math
@@ -12,12 +12,11 @@ from typing import Union
 import numpy as np
 import torch
 import torch.nn.functional as F
-import comfy.utils           # progress-bar hook
+import comfy.utils
 
 
-# ───────────────────────── helpers ──────────────────────────
 def to_tensor(img: Union[torch.Tensor, np.ndarray], device, channels: int):
-    """ComfyUI IMAGE → torch.float32 tensor on <device>, shape [H,W] or [H,W,3]."""
+    
     if isinstance(img, np.ndarray):
         t = torch.from_numpy(img).float()
     elif isinstance(img, torch.Tensor):
@@ -25,16 +24,15 @@ def to_tensor(img: Union[torch.Tensor, np.ndarray], device, channels: int):
     else:
         raise TypeError("expected torch.Tensor or np.ndarray")
 
-    # Unify layout
-    if t.dim() == 4 and t.shape[0] == 1:           # [1,H,W,C] → [H,W,C]
+    if t.dim() == 4 and t.shape[0] == 1:
         t = t.squeeze(0)
-    if t.dim() == 3 and t.shape[0] in (1, 3):      # [C,H,W]  → [H,W,C]
+    if t.dim() == 3 and t.shape[0] in (1, 3):
         t = t.permute(1, 2, 0)
 
-    if channels == 1 and t.dim() == 3:             # rgb → luma
+    if channels == 1 and t.dim() == 3:
         t = t.mean(-1)
     if channels == 3:
-        if t.dim() == 2:                           # grey → rgb
+        if t.dim() == 2:
             t = t.unsqueeze(-1).repeat(1, 1, 3)
         elif t.shape[-1] == 1:
             t = t.repeat(1, 1, 3)
@@ -43,7 +41,6 @@ def to_tensor(img: Union[torch.Tensor, np.ndarray], device, channels: int):
 
 
 def bilateral(img, guide, sigma_s=2, sigma_r=0.05):
-    """Fast bilateral blur on a single-channel [H,W] tensor."""
     k = sigma_s * 2 + 1
     grid = torch.arange(-sigma_s, sigma_s + 1, device=img.device)
     yy, xx = torch.meshgrid(grid, grid, indexing="ij")
@@ -68,9 +65,8 @@ def bilateral(img, guide, sigma_s=2, sigma_r=0.05):
     return out / norm.clamp_min_(1e-6)
 
 
-# ───────────────── tile runner ──────────────────────────────
 def run_on_tiles(
-    kernel,                              # per-tile AO function
+    kernel,
     depth, normals, base_color,
     tile       = 1024,
     overlap    = 32,
@@ -83,7 +79,6 @@ def run_on_tiles(
     ao_acc  = torch.zeros((H, W), dtype=depth.dtype, device=depth.device)
     weights = torch.zeros_like(ao_acc)
 
-    # Calculate total number of tiles for progress bar
     n_tiles_y = (H + stride - 1) // stride
     n_tiles_x = (W + stride - 1) // stride
     total_tiles = n_tiles_y * n_tiles_x
@@ -94,7 +89,6 @@ def run_on_tiles(
             y1 = min(y0 + tile, H)
             x1 = min(x0 + tile, W)
 
-            # Always use seamless wrapping for tile padding
             yp0 = y0 - margin
             yp1 = y1 + margin
             xp0 = x0 - margin
@@ -106,11 +100,9 @@ def run_on_tiles(
             n_crop = normals[y_idx][:, x_idx, ...]
             c_crop = base_color[y_idx][:, x_idx, ...]
 
-            # run kernel, do not update pbar inside kernel
             ao_crop = kernel(d_crop, c_crop, n_crop, **kargs, pbar=pbar)\
-                        .squeeze(0)[..., 0]        # [Hc,Wc]
+                        .squeeze(0)[..., 0]       
 
-            # blend mask (feather in margin)
             h, w = ao_crop.shape
             mask = torch.ones_like(ao_crop)
             if margin:
@@ -125,20 +117,16 @@ def run_on_tiles(
             ao_acc[y_idx[:, None], x_idx] += ao_crop * mask
             weights[y_idx[:, None], x_idx] += mask
 
-            # Update progress bar after each tile
             pbar.update(1)
 
     pbar.update_absolute(pbar.total)
     return (ao_acc / weights.clamp_min_(1e-6))\
         .unsqueeze(-1).repeat(1, 1, 3).unsqueeze(0)
 
-
-# ──────────────────── main node class ───────────────────────
 class AccurateAO_HBAO:
     TILE_SIZE   = 1024
     TILE_OVERLP = 32
 
-    # ───────── node I/O spec ─────────
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -171,7 +159,6 @@ class AccurateAO_HBAO:
     FUNCTION     = "hbao"
     CATEGORY     = "Cherry Nodes / Imaging"
 
-    # ───────── public entry point (tiled) ─────────
     def hbao(
         self,
         depth_map, base_color_map, normal_map,
@@ -187,12 +174,10 @@ class AccurateAO_HBAO:
     ):
         device = "cpu" if use_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
 
-        # convert full-res inputs
         depth   = to_tensor(depth_map,  device, 1)
         normals = to_tensor(normal_map, device, 3)
         color   = to_tensor(base_color_map, device, 3)
 
-        # kernel wrapper runs on one crop, now accepts pbar
         def _kernel(d, c, n, pbar=None):
             return self._hbao_single_tile(
                 d, c, n,
@@ -203,18 +188,14 @@ class AccurateAO_HBAO:
                 pbar=pbar
             )
 
-        # Handle tiling selection
         if tile_size == "No Tiling":
             img = _kernel(depth, color, normals)
         else:
             tile_size_int = int(tile_size)
-            # Enforce minimum tile size and overlap
             min_tile = 384
             if tile_size_int < min_tile:
                 tile_size_int = min_tile
-            # Overlap must be at least radius_px
             overlap = max(radius_px, 32)
-            # Prevent AO if radius is too large for tile
             if radius_px * 2 >= tile_size_int:
                 raise ValueError(f"AO radius ({radius_px}) is too large for the selected tile size ({tile_size_int}). Please choose a larger tile size or reduce the radius.")
             else:
@@ -224,7 +205,6 @@ class AccurateAO_HBAO:
                 )
         return (img,)
 
-    # ───────── original AO core (unchanged maths) ─────────
     def _hbao_single_tile(
         self,
         depth, base_color, normals,
@@ -236,25 +216,21 @@ class AccurateAO_HBAO:
     ):
         device = depth.device
 
-        # normalise depth
         depth = (depth - depth.amin()) / (depth.amax() - depth.amin() + 1e-6)
 
         H, W  = depth.shape
         steps = torch.arange(1, radius_px + 1, device=device)   # [S]
         thetas = torch.arange(sample_count, device=device) * (2 * math.pi / sample_count)
 
-        n = normals * 2 - 1                                     # −1‥1 normals
+        n = normals * 2 - 1                                    
         nx, ny, nz = n[..., 0], n[..., 1], n[..., 2]
 
         occl = torch.zeros_like(depth)
 
-        # base grids
         y0 = torch.arange(H, device=device)[:, None, None]
         x0 = torch.arange(W, device=device)[None, :, None]
 
-        # Only create a progress bar if not provided (for non-tiled mode)
         if pbar is not None:
-            # Don't update pbar here for tiled mode
             update_pbar = False
         else:
             pbar = comfy.utils.ProgressBar(len(thetas))
@@ -271,12 +247,12 @@ class AccurateAO_HBAO:
             else:
                 yi.clamp_(0, H - 1); xi.clamp_(0, W - 1)
 
-            samples = depth[yi, xi]                             # (H,W,S)
+            samples = depth[yi, xi]                          
 
             ndot = (nx * dx + ny * dy + nz * 0.2).clamp_(0.0, 1.0).unsqueeze(-1)
             samples = samples * ndot
 
-            horizon = samples.min(-1)[0]                        # nearest blocker
+            horizon = samples.min(-1)[0]
             diff    = (depth - horizon + height_bias).clamp_min_(0)
             occl   += diff
 
@@ -302,6 +278,5 @@ class AccurateAO_HBAO:
         return ao.unsqueeze(-1).repeat(1, 1, 3).unsqueeze(0)
 
 
-# ───────── Comfy registration ─────────
 NODE_CLASS_MAPPINGS        = {"AccurateAO_HBAO": AccurateAO_HBAO}
 NODE_DISPLAY_NAME_MAPPINGS = {"AccurateAO_HBAO": "Cherry Ambient Occlusion"}
