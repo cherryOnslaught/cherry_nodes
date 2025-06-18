@@ -1,7 +1,7 @@
+![Cherry Logo](media/cherry_logo.png)
 # Cherry Nodes for ComfyUI
-
 ## Overview
-Cherry Nodes is a collection of custom nodes for [ComfyUI](https://github.com/comfyanonymous/ComfyUI), focused on advanced image processing and utility functions. The highlight of this package is the **AccurateAO (HBAO) Node**, which provides high-quality, tileable ambient occlusion (AO) map generation from texture maps.
+Cherry Nodes is a collection of custom nodes for [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
 
 ---
 
@@ -17,20 +17,19 @@ Cherry Nodes is a collection of custom nodes for [ComfyUI](https://github.com/co
 
 ---
 
-## AccurateAO (HBAO) Node
+## Cherry Ambient Occlusion
 
 ### What It Does
-- High-quality, tileable ambient occlusion (AO) map generation from texture maps:
+- High-quality, tileable ambient occlusion map generation from texture maps:
   - **Color Map** (Albedo)
   - **Depth Map**
   - **Normal Map**
-- Supports seamless (tileable) texture processing.
+- Supports seamless texture processing.
 - Handles large images (e.g., 4K) by processing in tiles, with automatic overlap and blending to avoid seams.
-- Offers user control over AO quality, radius, sample count, and tiling.
 
 ### How It Works
 - Uses a Horizon-Based Ambient Occlusion (HBAO) algorithm, sampling the depth and normal maps in multiple directions to estimate occlusion.
-- Processes images in tiles with overlap and feathered blending to avoid visible seams, even for seamless textures.
+- Processes images in tiles with overlap and feathered blending to avoid visible seams.
 - Dynamically adjusts tile overlap to match the AO radius, and prevents settings that would cause artifacts.
 
 ### Node Inputs
@@ -43,17 +42,17 @@ Cherry Nodes is a collection of custom nodes for [ComfyUI](https://github.com/co
 - **Height Bias**: AO height bias (for fine-tuning contact shadows).
 - **Bilateral Blur**: Smooths AO using a bilateral filter.
 - **Seamless Textures Input**: Set to `True` if your textures are seamless/tileable.
-- **Use CPU**: Forces computation on CPU (default: auto-detects GPU).
+- **Use CPU**: Forces computation on CPU.
 - **Blur Source**: Which map to use as the guide for bilateral blur.
-- **Tile Size**: Choose tile size (384, 512, 1024) or "No Tiling". The node will warn and stop if the AO radius is too large for the selected tile size.
+- **Tile Size**: Optional tiling supported (384, 512, 1024) for low GPU memory situations. The node will warn and stop if the AO radius is too large for the selected tile size.
 
 ### Node Output
-- **Ambient Occlusion Map**: An AO map (RGB) matching the input resolution.
+- **Ambient Occlusion Map**: An AO map matching the input resolution.
 
 ---
 
 ## Usage Tips
-- For seamless textures, enable **Seamless Textures Input**.
+- To maintain the seamlessness of seamless texture inputs in the Generated ambient occlusion output, enable **Seamless Textures Input**.
 - For large AO radii, use larger tile sizes to avoid artifacts.
 - If you see a warning about tile size vs. radius, increase the tile size or reduce the radius.
 
